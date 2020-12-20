@@ -1,0 +1,206 @@
+---
+title: "COVID-19 Infection Rate Prediction"
+output: html_notebook
+author: Karthick Sivakumar
+date: 20 December 2020
+---
+
+
+```{r}
+library(dplyr)
+library(data.table)
+library(rpart.plot)
+library("caret")
+library("e1071")
+library("caTools")
+library("ROCR")
+library("kknn")
+library(randomForest)
+```
+
+Load and merge data
+
+```{r}
+setwd("~/Documents/Lehigh/FALL2020/CSE160/")
+COVdat<-as.data.frame(read.csv("CovidData.csv"))
+Unemploymentdat<-as.data.frame(read.csv("ststdsadata1.csv"))
+COVdat<-na.omit(COVdat);COVdat
+Unemploymentdat<-na.omit(Unemploymentdat);Unemploymentdat
+mergedDB<-merge(COVdat, Unemploymentdat, by = c("state", "month"), all = FALSE)
+mergedDB
+```
+
+Find the quartiles of new_confirmed cases and assign each row its appropriate quartile
+
+```{r}
+mean(COVdat[,"new_confirmed"])
+min(COVdat[,"new_confirmed"])
+quantile(COVdat[,"new_confirmed"])
+newDB <- mergedDB %>% mutate(condition = case_when(new_confirmed < 33 ~ '1',
+                                  new_confirmed < 496 ~ '2',
+                                  new_confirmed < 1710 ~ '3',
+                                  new_confirmed <= 36048 ~ '4'))
+# newDB<-select(newDB, -c("new_confirmed"))
+newDB$condition <- as.factor(newDB$condition)
+newDB
+```
+
+
+```{r}
+# library(dplyr)
+df1 = newDB %>%
+   group_by(month, state) %>%
+   summarise(totalConfirm = sum(new_confirmed),
+             totalTest = sum(new_tested),
+             AvgUnemployedRate=(mean(percent.unemployed)), 
+             AvgTemp=(mean(average_temperature_celsius)), 
+             AvgRainFall=(mean(rainfall_mm)),
+             )
+df1
+
+growth <- function(x)x/lag(x)-1
+
+# install.packages("tidyverse")
+# library("tidyverse")
+confirm_pct_change = df1 %>%
+  group_by(state) %>% 
+  mutate(pct_change = (totalConfirm/lag(totalConfirm) - 1) * 100)
+
+  dt2 = df1 %>%
+   group_by(month) %>%
+   summarize(totalConfirms = sum(totalConfirm))
+
+growth_rate = dt2 %>%
+  # first sort by year
+  arrange(month) %>%
+  mutate(Diff_month = month - lag(month),  # Difference in time (just in case there are gaps)
+         Diff_growth = totalConfirms - lag(totalConfirms), # Difference in route between years
+         Rate_percent = (Diff_growth / Diff_month)/totalConfirms * 100) # growth rate in percent
+setDT(growth_rate)
+growth_rate[is.na(growth_rate)] <- 0
+growth_rate$month <- as.factor(growth_rate$month)
+growth_rate
+
+ggplot(growth_rate) + 
+  geom_col(aes(x = month, y = totalConfirms), size = 1, color = "sienna3", fill = "tan1") +
+  geom_line(aes(x = month, y = 10000*Rate_percent), size = 1.5, color="red", group = 1) + 
+  scale_y_continuous(sec.axis = sec_axis(~./10000, name = "grawth rate %"))
+
+covidtimeseries<-ts(dt2$totalConfirms, start = c(1),frequency = 1)
+covidtimeseries
+plot.ts(covidtimeseries)
+```
+
+Naive Bayes
+```{r}
+#split data for testing and training
+split.nb <- sample.split(newDB$condition, SplitRatio = 0.2)
+# create training and testing sets
+testData <- newDB[split.nb,]
+trainData <- newDB[-split.nb,]
+# make nb model
+model.nb <- naiveBayes(trainData$condition~new_deceased+new_tested+average_temperature_celsius+minimum_temperature_celsius+maximum_temperature_celsius
++rainfall_mm+total.unemployed+percent.unemployed,trainData)
+# prediction
+Prediction <- predict(model.nb, testData, type='class')
+# table
+tab <- table(testData$condition, Prediction)
+nb.accuracy <- sum(diag(tab))/sum(tab)
+tab; nb.accuracy
+precision <- tab[1,1] / sum(tab[1,]) # Precision = TP / (TP + FP)
+recall <- tab[1,1] / sum(tab[,1]) # Recall = TP / (TP + FN)
+fMeasure <- 2 * precision * recall / (precision + recall);
+accuracy <- sum(diag(tab))/sum(tab);
+cat("accuracy:", accuracy, '\n')
+cat("precision:", precision, '\n')
+cat("recall:", recall, '\n')
+cat("f-measure:", fMeasure)
+```
+
+K-Nearest Neighbors
+```{r}
+#split data for testing and training
+split.knn <- sample.split(newDB$condition, SplitRatio = 0.2)
+# create training and testing sets
+testData <- newDB[split.knn,]
+trainData <- newDB[-split.knn,]
+# make knn model
+train.kknn <- kknn(condition~new_deceased+new_tested+average_temperature_celsius+minimum_temperature_celsius+maximum_temperature_celsius
++rainfall_mm+total.unemployed+percent.unemployed, trainData, testData, distance = 2)
+# prediction
+fit <- fitted(train.kknn)
+# table
+tab <- table(data.frame(testData$condition,fit))
+kknn.accuracy <- sum(diag(tab))/sum(tab)
+tab; kknn.accuracy
+precision <- tab[1,1] / sum(tab[1,]) # Precision = TP / (TP + FP)
+recall <- tab[1,1] / sum(tab[,1]) # Recall = TP / (TP + FN)
+fMeasure <- 2 * precision * recall / (precision + recall);
+accuracy <- sum(diag(tab))/sum(tab);
+cat("accuracy:", accuracy, '\n')
+cat("precision:", precision, '\n')
+cat("recall:", recall, '\n')
+cat("f-measure:", fMeasure)
+```
+
+Support Vector Machines
+```{r}
+#Get the data
+svmDF <- select(newDB, -c("new_confirmed","month","FIPS", "Civilian.Population", "StateFull","Year","total.labor.force","percent.of.population","Total.Employed", "percent.employed"))
+# svmDF$condition <- as.factor(svmDF$condition)
+#Create training and testing sets
+split.svm <- sample.split(svmDF$condition, SplitRatio = 0.2)
+dfTest <- svmDF[split.svm,]
+dfTrain <- svmDF[-split.svm,]
+#Training model
+model <- svm(formula = condition~new_deceased+new_tested+average_temperature_celsius+minimum_temperature_celsius+maximum_temperature_celsius
++rainfall_mm+total.unemployed+percent.unemployed, data = dfTrain, type = "C-classification",kernel = "linear")
+#Test the model on the Test data
+prediction <- predict(model, newdata =  dfTest)
+#Confusion Matrix and accuracy calculation
+confusionMatrix <- table(data.frame(dfTest$condition, pred = prediction))
+svm.accuracy <- sum(diag(confusionMatrix))/sum(confusionMatrix)
+confusionMatrix;svm.accuracy
+precision <- tab[1,1] / sum(tab[1,]) # Precision = TP / (TP + FP)
+recall <- tab[1,1] / sum(tab[,1]) # Recall = TP / (TP + FN)
+fMeasure <- 2 * precision * recall / (precision + recall);
+accuracy <- sum(diag(tab))/sum(tab);
+cat("accuracy:", accuracy, '\n')
+cat("precision:", precision, '\n')
+cat("recall:", recall, '\n')
+cat("f-measure:", fMeasure)
+```
+
+Decision Trees
+```{r}
+DTdata<-select(newDB, -c("new_confirmed","month","FIPS", "Civilian.Population", "StateFull","Year","total.labor.force","percent.of.population","Total.Employed", "percent.employed"))
+DTdata$total.unemployed <- as.numeric(DTdata$total.unemployed)
+set.seed(1234)
+train <-sample(nrow(DTdata),0.8*nrow(DTdata))
+DTdata.train = DTdata[train,]
+DTdata.test = DTdata[-train,]
+DTdata
+fit <- rpart(condition~new_deceased+new_tested+average_temperature_celsius+minimum_temperature_celsius+maximum_temperature_celsius
++rainfall_mm+total.unemployed+percent.unemployed, data=DTdata.train, method="class")
+Tprediction <- predict(fit, DTdata.test, type="class") 
+tab <- table(DTdata.test$condition, Tprediction)
+dt.accuracy <- sum(diag(tab))/sum(tab)
+tab; dt.accuracy
+precision <- tab[1,1] / sum(tab[1,]) # Precision = TP / (TP + FP)
+recall <- tab[1,1] / sum(tab[,1]) # Recall = TP / (TP + FN)
+fMeasure <- 2 * precision * recall / (precision + recall);
+accuracy <- sum(diag(tab))/sum(tab);
+cat("accuracy:", accuracy, '\n')
+cat("precision:", precision, '\n')
+cat("recall:", recall, '\n')
+cat("f-measure:", fMeasure)
+```
+```{r}
+accuracy <- c(nb.accuracy, kknn.accuracy, svm.accuracy, dt.accuracy)
+classifier <- c("Naive Bayes", "K-Nearest Neighbor", "SVM", "Decision Tree")
+dat<-data.frame(accuracy, classifier)
+ggplot(dat) + 
+  geom_col(aes(x = classifier, y = accuracy), size = 1, color = "sienna3", fill = "tan1")+ggtitle("Accuracies by Classifier")
+```
+
+
